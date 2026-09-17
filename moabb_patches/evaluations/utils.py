@@ -1,0 +1,565 @@
+from __future__ import annotations
+
+import functools
+import logging
+import warnings
+from pathlib import Path
+from pickle import HIGHEST_PROTOCOL, dump
+from typing import Sequence
+
+import numpy as np
+from mne.utils.config import _open_lock
+from numpy import argmax
+from sklearn.base import ClassifierMixin
+from sklearn.metrics import check_scoring
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+
+
+log = logging.getLogger(__name__)
+
+
+try:
+    from optuna.distributions import CategoricalDistribution
+
+    optuna_available = True
+except ImportError:
+    optuna_available = False
+
+
+try:
+    from codecarbon import EmissionsTracker, OfflineEmissionsTracker
+
+    _carbonfootprint = True
+except ImportError:
+    _carbonfootprint = False
+
+
+def _ensure_fitted(estimator):
+    """Ensure an estimator is properly marked as fitted for sklearn 1.8+.
+
+    In sklearn 1.8+, Pipeline.predict() calls check_is_fitted(self) which
+    may fail for some estimators (especially deep learning wrappers) that
+    don't properly set fitted attributes. This function adds the necessary
+    attributes to ensure the estimator passes sklearn's fitted check.
+
+    Parameters
+    ----------
+    estimator : sklearn-compatible estimator
+        The fitted estimator to mark as fitted. This should be called
+        after fit() has been called on the estimator.
+
+    Returns
+    -------
+    estimator : sklearn-compatible estimator
+        The same estimator with fitted attributes set.
+
+    Notes
+    -----
+    This function modifies the estimator in-place and returns it for
+    convenience. sklearn's check_is_fitted looks for:
+    1. __sklearn_is_fitted__() method returning True
+    2. Or any attribute ending with '_' (like classes_, coef_, etc.)
+
+    We add a __sklearn_is_fitted__ method that returns True.
+    """
+
+    # Define a method that returns True to indicate fitted state
+    def _sklearn_is_fitted_true(self):
+        return True
+
+    # Add __sklearn_is_fitted__ method if not present or if it returns False
+    if not hasattr(estimator, "__sklearn_is_fitted__"):
+        import types
+
+        estimator.__sklearn_is_fitted__ = types.MethodType(
+            _sklearn_is_fitted_true, estimator
+        )
+    else:
+        # Check if existing method returns False (unfitted)
+        try:
+            if not estimator.__sklearn_is_fitted__():
+                import types
+
+                estimator.__sklearn_is_fitted__ = types.MethodType(
+                    _sklearn_is_fitted_true, estimator
+                )
+        except Exception:
+            pass
+
+    # For Pipeline objects, also ensure all steps are marked
+    if isinstance(estimator, Pipeline):
+        for name, step in estimator.steps:
+            if step is not None:
+                _ensure_fitted(step)
+
+    return estimator
+
+
+def _check_if_is_pytorch_model(model):
+    """Check if the model is a skorch model.
+
+    Parameters
+    ----------
+    model: object
+        Model to check
+    Returns
+    -------
+    is_pytorch_model: bool
+        True if the model is a Skorch model
+    """
+    try:
+        from skorch import NeuralNetClassifier
+
+        is_pytorch_model = isinstance(model, NeuralNetClassifier)
+        return is_pytorch_model
+    except ImportError:
+        return False
+
+
+def _check_if_is_pytorch_steps(model):
+    skorch_valid = False
+    try:
+        skorch_valid = any(
+            _check_if_is_pytorch_model(j) for j in model.named_steps.values()
+        )
+        return skorch_valid
+    except Exception:
+        return skorch_valid
+
+
+def _save_model_cv(model: object, save_path: str | Path, cv_index: str | int):
+    """Save a model fitted to a given fold from cross-validation.
+
+    Parameters
+    ----------
+    model: object
+        Model (pipeline) fitted
+    save_path: str
+        Path to save the model, will create if it does not exist
+        based on the parameter hdf5_path from the evaluation object.
+    cv_index: str
+        Index of the cross-validation fold used to fit the model
+        or 'best' if the model is the best fitted
+
+    Returns
+    -------
+    """
+    if save_path is None:
+        raise IOError("No path to save the model")
+    else:
+        Path(save_path).mkdir(parents=True, exist_ok=True)
+
+
+    if hasattr(model, 'best_params_'):
+        import pandas as pd
+        best_params = model.best_params_
+        best_score = model.best_score_
+        params_record = {
+            'cv_index': cv_index,
+            'best_score': best_score,
+            **best_params
+        }
+        params_file = Path(save_path) / f"best_params_{cv_index}.csv"
+        df = pd.DataFrame([params_record])
+        if params_file.exists():
+            existing = pd.read_csv(params_file)
+            df = pd.concat([existing, df], ignore_index=True)
+        df.to_csv(params_file, index=False)
+
+
+    if _check_if_is_pytorch_steps(model):
+        for step_name in model.named_steps:
+            step = model.named_steps[step_name]
+            file_step = f"{step_name}_fitted_{cv_index}"
+
+            if _check_if_is_pytorch_model(step):
+                step.save_params(
+                    f_params=Path(save_path) / f"{file_step}_model.pkl",
+                    f_optimizer=Path(save_path) / f"{file_step}_optim.pkl",
+                    f_history=Path(save_path) / f"{file_step}_history.json",
+                    f_criterion=Path(save_path) / f"{file_step}_criterion.pkl",
+                )
+            else:
+                with _open_lock((Path(save_path) / f"{file_step}.pkl"), "wb") as file:
+                    dump(step, file, protocol=HIGHEST_PROTOCOL)
+    else:
+        with _open_lock((Path(save_path) / f"fitted_model_{cv_index}.pkl"), "wb") as file:
+            dump(model, file, protocol=HIGHEST_PROTOCOL)
+
+
+def _save_model_list(model_list: list | Pipeline, score_list: Sequence, save_path: str):
+    """Save a list of models fitted to a folder.
+
+    Parameters
+    ----------
+    model_list: list | Pipeline
+        List of models or model (pipelines) fitted
+    score_list: Sequence
+        List of scores for each model in model_list
+    save_path: str
+        Path to save the models, will create if it does not exist
+        based on the parameter hdf5_path from the evaluation object.
+    Returns
+    -------
+    """
+    if model_list is None:
+        return
+
+    Path(save_path).mkdir(parents=True, exist_ok=True)
+
+    if not isinstance(model_list, list):
+        model_list = [model_list]
+
+    for cv_index, model in enumerate(model_list):
+        _save_model_cv(model, save_path, str(cv_index))
+
+    best_model = model_list[argmax(score_list)]
+
+    _save_model_cv(best_model, save_path, "best")
+
+
+def _create_save_path(
+    hdf5_path,
+    code: str,
+    subject: int | str,
+    session: str,
+    name: str,
+    grid=False,
+    eval_type="WithinSession",
+):
+    """Create a save path based on evaluation parameters.
+
+    Parameters
+    ----------
+    hdf5_path : str
+       The base path where the models will be saved.
+    code : str
+       The code for the evaluation.
+    subject : int
+       The subject ID for the evaluation.
+    session : str
+       The session ID for the evaluation.
+    name : str
+       The name for the evaluation.
+    grid : bool, optional
+       Whether the evaluation is a grid search or not. Defaults to False.
+    eval_type : str, optional
+       The type of evaluation, either 'WithinSession', 'CrossSession' or 'CrossSubject'.
+       Defaults to WithinSession.
+    Returns
+    -------
+    path_save: str
+       The created save path.
+    """
+    if hdf5_path is not None:
+        if eval_type != "WithinSession":
+            session = ""
+
+        if grid:
+            path_save = (
+                Path(hdf5_path)
+                / f"GridSearch_{eval_type}"
+                / code
+                / f"{str(subject)}"
+                / str(session)
+                / str(name)
+            )
+        else:
+            path_save = (
+                Path(hdf5_path)
+                / f"Models_{eval_type}"
+                / code
+                / f"{str(subject)}"
+                / str(session)
+                / str(name)
+            )
+
+        return str(path_save)
+    else:
+        log.warning("No hdf5_path provided, models will not be saved.")
+
+
+def _convert_sklearn_params_to_optuna(param_grid: dict) -> dict:
+    """
+    Function to convert the parameter in Optuna format. This function will
+    create a categorical distribution of values from the list of values
+    provided in the parameter grid.
+
+    Parameters
+    ----------
+    param_grid:
+        Dictionary with the parameters to be converted.
+
+    Returns
+    -------
+    optuna_params: dict
+        Dictionary with the parameters converted to Optuna format.
+    """
+    if not optuna_available:
+        raise ImportError(
+            "Optuna is not available. Please install it optuna " "and optuna-integration."
+        )
+    else:
+        optuna_params = {}
+        for key, value in param_grid.items():
+            try:
+                if isinstance(value, list):
+                    optuna_params[key] = CategoricalDistribution(value)
+                else:
+                    optuna_params[key] = value
+            except Exception as e:
+                raise ValueError(f"Conversion failed for parameter {key}: {e}")
+        return optuna_params
+
+
+# Classifier-only OptunaSearchCV wrapper logic.
+#
+# MOABB currently benchmarks classification tasks only. We therefore provide a
+# single wrapper class adding ClassifierMixin and setting `_estimator_type` to
+# "classifier" so that scikit-learn>=1.7 correctly infers response methods.
+# This avoids the earlier need for dynamic factory logic and pickling issues
+# with locally scoped classes.
+
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "OptunaSearchCV is experimental")
+        # OptunaSearchCV emits an ExperimentalWarning (subclass of FutureWarning)
+        # on import; suppress it since MOABB intentionally uses this API.
+        from optuna.integration import OptunaSearchCV as _BaseOptunaSearchCV
+
+    # Monkey-patch _BaseOptunaSearchCV.__init__ to suppress the
+    # ExperimentalWarning on every instantiation (including sklearn clone).
+
+    _orig_init = _BaseOptunaSearchCV.__init__
+
+    @functools.wraps(_orig_init)
+    def _quiet_init(self, *args, **kwargs):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", "OptunaSearchCV is experimental")
+            _orig_init(self, *args, **kwargs)
+
+    _BaseOptunaSearchCV.__init__ = _quiet_init
+
+    class OptunaSearchCVClassifier(_BaseOptunaSearchCV, ClassifierMixin):
+        _estimator_type = "classifier"
+
+        def __sklearn_tags__(self):  # scikit-learn >=1.7 tag override
+            tags = super().__sklearn_tags__()
+
+            if isinstance(tags, dict):
+                tags["estimator_type"] = "classifier"
+                return tags
+
+            try:
+                tags["estimator_type"] = "classifier"
+            except Exception:
+                try:
+                    tags.estimator_type = "classifier"
+                except Exception:
+                    return {"estimator_type": "classifier"}
+
+            return tags
+
+    _classifier_wrapper_available = True
+except ImportError:  # pragma: no cover - optuna not installed path
+    OptunaSearchCVClassifier = None
+    _classifier_wrapper_available = False
+
+
+def check_search_available():
+    """Return available search methods and Optuna availability flag.
+
+    Always returns a classifier-only OptunaSearchCV when optuna is installed.
+    """
+    if _classifier_wrapper_available and OptunaSearchCVClassifier is not None:
+
+        def OptunaSearchCV(estimator, param_distributions, **kwargs):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", "OptunaSearchCV is experimental", FutureWarning
+                )
+                return OptunaSearchCVClassifier(estimator, param_distributions, **kwargs)
+
+        search_methods = {"grid": GridSearchCV, "optuna": OptunaSearchCV}
+        return search_methods, True
+    else:
+        return {"grid": GridSearchCV}, False
+
+
+class _DictScorer:
+    """Wrapper that converts a single scorer to return dict format."""
+
+    def __init__(self, scorer):
+        self.scorer = scorer
+
+    def __call__(self, estimator, X, y_true=None, **kwargs):
+        return {"score": self.scorer(estimator, X, y_true, **kwargs)}
+
+
+def _create_scorer(estimator, scoring):
+    """Create a scorer that always returns a dict.
+
+    Wraps single scorers to return {"score": value} while leaving
+    multi-metric scoring to sklearn's check_scoring.
+
+    Parameters
+    ----------
+    estimator : sklearn-compatible estimator
+        The fitted estimator to use for scoring validation.
+    scoring : str, callable, dict, list, or None
+        The scoring specification. Can be:
+        - None: uses default scorer
+        - str: a single scorer name (e.g., "accuracy")
+        - callable: a single scorer function
+        - dict: {name: scorer} for multiple metrics
+        - list: list of scorer names or callables
+
+    Returns
+    -------
+    scorer : callable
+        Scorer that always returns dict of scores.
+
+    """
+    if isinstance(scoring, (dict, list)):
+        # check_scoring returns a multi-metric scorer for dict/list inputs
+        return check_scoring(estimator, scoring=scoring)
+    else:
+        # Wrap single scorer to return dict with key "score"
+        single_scorer = check_scoring(estimator, scoring=scoring)
+        return _DictScorer(single_scorer)
+
+
+def _average_scores(fold_scores):
+    """Average scores across CV folds.
+
+    Parameters
+    ----------
+    fold_scores : list of dict
+        List of score dictionaries from each CV fold.
+        All dicts must have the same keys. Must not be empty.
+
+    Returns
+    -------
+    mean_scores : dict
+        Dictionary with same keys as input, values are means across folds.
+
+    Raises
+    ------
+    ValueError
+        If fold_scores is empty.
+    """
+    if not fold_scores:
+        raise ValueError("fold_scores cannot be empty")
+    keys = fold_scores[0].keys()
+    return {key: np.mean([fold[key] for fold in fold_scores]) for key in keys}
+
+
+def _update_result_with_scores(res, scores):
+    """Update result dict with scores.
+
+    For single-metric scoring (dict with only "score" key), only adds "score".
+    For multi-metric scoring, adds "score" (first metric) and
+    "score_{name}" for each metric.
+
+    Parameters
+    ----------
+    res : dict
+        Result dictionary to update in-place.
+    scores : dict
+        Dictionary of score values.
+
+    Returns
+    -------
+    res : dict
+        The updated result dictionary.
+    """
+    if list(scores.keys()) == ["score"]:
+        # Single scorer
+        res["score"] = scores["score"]
+    else:
+        # Multi-metric: primary score is first metric value
+        res["score"] = next(iter(scores.values()))
+        # Add individual score columns
+        res.update({f"score_{key}": value for key, value in scores.items()})
+    return res
+
+
+def _score_and_update(res, scorer, model, X, y_true):
+    """Score model and update result dict.
+
+    Combines scoring and result update into a single call.
+    This is a building block for future _evaluate_fold refactoring.
+
+    Parameters
+    ----------
+    res : dict
+        Result dictionary to update in-place.
+    scorer : callable
+        Scorer function that returns a dict of scores.
+    model : estimator
+        Fitted model to score.
+    X : :class:`numpy.ndarray`
+        Test features.
+    y_true : :class:`numpy.ndarray`
+        Test labels.
+
+    Returns
+    -------
+    res : dict
+        The updated result dictionary.
+    """
+    score = scorer(model, X, y_true)
+    return _update_result_with_scores(res, score)
+
+
+def _pipeline_requires_epochs(pipeline):
+    """Check if any step in the pipeline requires MNE Epochs objects."""
+    from moabb.pipelines.classification import SSVEP_CCA, SSVEP_TRCA, SSVEP_MsetCCA
+
+    # Handle non-pipeline classifiers (like DummyClassifier)
+    if not hasattr(pipeline, "steps"):
+        return isinstance(pipeline, (SSVEP_CCA, SSVEP_TRCA, SSVEP_MsetCCA))
+
+    for name, step in pipeline.steps:
+        if isinstance(step, (SSVEP_CCA, SSVEP_TRCA, SSVEP_MsetCCA)):
+            return True
+    return False
+
+
+def _get_nchan(X):
+    """Extract number of channels from data (Epochs or ndarray)."""
+    from mne.epochs import BaseEpochs
+
+    return X.info["nchan"] if isinstance(X, BaseEpochs) else X.shape[1]
+
+
+class Emissions:
+    def __init__(self, codecarbon_config=None):
+        self.codecarbon_config = codecarbon_config
+        if codecarbon_config is None:
+            # Default CodeCarbon configurations
+            self.codecarbon_config = dict(save_to_file=False, log_level="error")
+            self.codecarbon_offline = False
+        else:
+            # Offline mode parameters are a superset of online mode parameters
+            # Hardcode check avoids object reflection for security and compatibility
+            # For more information see CodeCarbon documentation
+            # https://mlco2.github.io/codecarbon/parameters.html#specific-parameters-for-offline-mode
+            offline_params = [
+                "country_iso_code",
+                "region",
+                "cloud_provider",
+                "cloud_region",
+                "country_2letter_iso_code",
+            ]
+            self.codecarbon_offline = any(
+                key in self.codecarbon_config for key in offline_params
+            )
+
+    def create_tracker(self):
+        if self.codecarbon_offline:
+            tracker = OfflineEmissionsTracker(**self.codecarbon_config)
+        else:
+            tracker = EmissionsTracker(**self.codecarbon_config)
+        return tracker
