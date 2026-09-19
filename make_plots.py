@@ -51,12 +51,12 @@ def anbf_e_cm():
 def fbanbf_heatmap():
     df = load_folder(data_path, "fbanbf_grid_secondW_thirdW_n8_tmax5.5", "FBANBF", "CustomFilterBankSSVEP_ANBF", 5.5)
     stats = df.groupby(["w_2", "w_3"])["Accuracy"].mean().round(4)
-    plot_heatmap(stats, "Third Filter Bank Weight", "Second Filter Bank Weight")
+    plot_heatmap(stats, "Third Filter Bank Weight (w_3)", "Second Filter Bank Weight (w_2)")
 
 def anbf_e_heatmap():
     df = load_folder(data_path, "anbf_e_grid_m_lr_n40_tmax3.64", "ANBF_e", "CustomFilterBankSSVEP_ANBF", 3.64)
     stats = df.groupby(["w_c", "w_lr"])["Accuracy"].mean().round(4)
-    plot_heatmap(stats, "Side Weight", "Main Weight")
+    plot_heatmap(stats, "Side Weight (w_lr)", "Main Weight (w_c)")
 
 def tmax_3m_n_arr_itr():
     dfs = []
@@ -113,7 +113,7 @@ def n8n40_ttest():
     base_run = RunSpec("three_methods_tmax_n8", "tmax5.5_n8", "ANBF")    
     target_runs = [
         RunSpec("test_tmax_n8", "tmax5.5_n8/ANBF_e_GRID", "ANBF_e_GRID"),
-        RunSpec("test_tmax_n8", "tmax5.5_n8/FBANBF_GRID", "FBANBF_GRID") ########################################
+        RunSpec("test_tmax_n8", "tmax5.5_n8/FBANBF_GRID", "FBANBF_GRID")
         ]
     
     # # n = 40

@@ -3,7 +3,7 @@ import seaborn as sns
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
-def plot_matrix(df_cm, title, diff=False, svg=False, figsize=(10, 8)):
+def plot_matrix(df_cm, title, diff=False, svg=False, figsize=(10, 8), csv=False):
     cmap = LinearSegmentedColormap.from_list('GreenWhiteRed', ['green', 'white', 'red']) if diff else "Blues" 
     norm = TwoSlopeNorm(vmin=df_cm.min(), vcenter=0, vmax=df_cm.max()) if diff else None
     
@@ -25,7 +25,14 @@ def plot_matrix(df_cm, title, diff=False, svg=False, figsize=(10, 8)):
         new_index = list(range(31,41)) + list(range(1,31))
         df_cm = df_cm.reindex(index=new_index, columns=new_index)
     
-    df_cm.round(1).to_csv('output.csv', index=True)
+    
+    df_cm_labeled = df_cm.copy()
+    df_cm_labeled.index = [freq_map[i-1] for i in new_index]
+    df_cm_labeled.columns = [freq_map[i-1] for i in new_index]
+    print(df_cm_labeled)
+    if csv:
+        df_cm_labeled.round(1).to_csv(f'{title}_cm.csv', float_format='%.1f')
+        
     ax = sns.heatmap(df_cm, annot=True, fmt='.1f', cmap=cmap, norm=norm,
         xticklabels=[freq_map[i-1] for i in new_index], 
         yticklabels=[freq_map[i-1] for i in new_index],
